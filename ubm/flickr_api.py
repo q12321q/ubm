@@ -1,10 +1,12 @@
+from enum import Enum
 import webbrowser
 import requests
 import requests_oauthlib
 import logging
-from flask import Flask, request
 from requests_oauthlib import OAuth1Session
 import xml.etree.ElementTree as ET
+
+from ubm.oauth1_callback_server import OAuthCallbackServer
 
 REQUEST_TOKEN_URL = 'https://www.flickr.com/services/oauth/request_token'
 AUTHORIZATION_URL = 'https://www.flickr.com/services/oauth/authorize'
@@ -12,24 +14,80 @@ ACCESS_TOKEN_URL = 'https://www.flickr.com/services/oauth/access_token'
 API_URL = 'https://api.flickr.com/services/rest'
 UPLOAD_API_URL = 'https://up.flickr.com/services/upload'
 
-app = Flask(__name__)
+
+class Permission(Enum):
+    read = 1
+    write = 2
+    delete = 3
+
+
+def request_user_authorization(client_key,
+                               client_secret,
+                               perms=Permission.write):
+    user_callback_url_host = 'localhost'
+    user_callback_url_port = 7777
+    user_callback_url = 'http://%s:%s/callback' % (
+        user_callback_url_host,
+        user_callback_url_port
+    )
+
+    # Obtain a request token
+    oauth = OAuth1Session(client_key,
+                          client_secret=client_secret,
+                          callback_uri=user_callback_url)
+    request_token_response = oauth.fetch_request_token(REQUEST_TOKEN_URL)
+
+    request_token = request_token_response.get('oauth_token')
+    request_token_secret = request_token_response.get('oauth_token_secret')
+
+    # Obtain authorization from the user
+    authorization_url = oauth.authorization_url(AUTHORIZATION_URL)
+    if perms is not None:
+        authorization_url += '&perms=%s' % perms.name
+
+    try:
+        webbrowser.open(authorization_url)
+
+        server = OAuthCallbackServer(user_callback_url_host,
+                                     user_callback_url_port)
+        server.start()
+
+        callback_url_with_tokens = server.wait_for_callback_url()
+
+        server.stop()
+
+        oauth_response = oauth.parse_authorization_response(
+                                      callback_url_with_tokens)
+        verifier = oauth_response['oauth_verifier']
+    except webbrowser.Error:
+        print('Please go here and authorize %s' % authorization_url)
+        verifier = input('Please input the verifier: ')
+
+    # Obtain owner tokens from user verifier and request toekn
+    oauth = OAuth1Session(client_key,
+                          client_secret=client_secret,
+                          resource_owner_key=request_token,
+                          resource_owner_secret=request_token_secret,
+                          verifier=verifier)
+
+    oauth_tokens = oauth.fetch_access_token(ACCESS_TOKEN_URL)
+    return {
+        'resource_owner_key': oauth_tokens.get('oauth_token'),
+        'resource_owner_secret': oauth_tokens.get('oauth_token_secret')
+    }
+
 
 class FlickrAPIError(Exception):
-    def __init__(self, value):
+    def __init__(self, value, code=None, message=None):
         self.value = value
+        self.code = code
+        self.message = message
+
     def __str__(self):
         return repr(self.value)
 
-@app.route('/callback')
-def receive_token():
-    oauth_access_token = request.form['access_token']
-    func = request.environ.get('werkzeug.server.shutdown')
-    if func is None:
-        raise RuntimeError('Not running with the Werkzeug Server')
-    func()
 
-
-class FlickrAPI:
+class FlickrAPI(object):
 
     SUPPORTED_IMAGE_FILE_TYPES = {
         'jpeg',
@@ -53,49 +111,13 @@ class FlickrAPI:
     def __init__(self,
                  client_key,
                  client_secret,
-                 resource_owner_key=None,
-                 resource_owner_secret=None):
+                 resource_owner_key,
+                 resource_owner_secret):
         self.logger = logging.getLogger(__name__)
         self.client_key = client_key
         self.client_secret = client_secret
         self.resource_owner_key = resource_owner_key
         self.resource_owner_secret = resource_owner_secret
-
-    def request_owner_tokens(self):
-        user_callback_url = 'http://localhost:7777/'
-
-        # Obtain a request token
-        oauth = OAuth1Session(self.client_key,
-                              client_secret=self.client_secret,
-                              callback_uri=user_callback_url)
-        request_token_response = oauth.fetch_request_token(REQUEST_TOKEN_URL)
-
-        request_token = request_token_response.get('oauth_token')
-        request_token_secret = request_token_response.get('oauth_token_secret')
-
-        # Obtain authorization from the user
-        authorization_url = oauth.authorization_url(AUTHORIZATION_URL)
-
-        try:
-            webbrowser.open(authorization_url)
-            app.run(
-              port=7777,
-              host='localhost'
-            )
-        except webbrowser.Error:
-            print('Please go here and authorize %s' % authorization_url)
-            verifier = input('Please input the verifier: ')
-
-        # Obtain owner tokens from user verifier and request toekn
-        oauth = OAuth1Session(self.client_key,
-                              client_secret=self.client_secret,
-                              resource_owner_key=request_token,
-                              resource_owner_secret=request_token_secret,
-                              verifier=verifier)
-
-        oauth_tokens = oauth.fetch_access_token(ACCESS_TOKEN_URL)
-        self.resource_owner_key = oauth_tokens.get('oauth_token')
-        self.resource_owner_secret = oauth_tokens.get('oauth_token_secret')
 
     def session(self):
         """docstring for session"""
@@ -124,7 +146,9 @@ class FlickrAPI:
         if result['stat'] == 'ok':
             return result[key] if key is not None else None
         else:
-            raise FlickrAPIError(result)
+            raise FlickrAPIError(result,
+                                 code=int(result['code']),
+                                 message=result['message'])
 
     def get(self, method, key, params=None, extras=None):
         _params = {}
@@ -174,11 +198,33 @@ class FlickrAPI:
     # Photo
     ######################
 
-    def get_photo_not_in_set(self, extras=None):
+    def get_photo_info(self, photo_id):
+        return self.get('flickr.photos.getInfo',
+                        'photo',
+                        params={
+                            'photo_id': photo_id
+                        })
+
+    def search_photos(self, params, extras=None):
+        return self.get_collection('flickr.photos.search',
+                                   'photos',
+                                   'photo',
+                                   params=params,
+                                   extras=extras)
+
+    def delete_photo(self, photo_id):
+        return self.post('flickr.photos.delete',
+                         None,
+                         params={
+                             'photo_id': photo_id
+                         })
+
+    def get_photos_not_in_set(self, extras=None):
         return self.get_collection('flickr.photos.getNotInSet',
                                    'photos',
                                    'photo',
                                    extras=extras)
+
     ######################
     # Photoset
     ######################
@@ -209,15 +255,20 @@ class FlickrAPI:
                          'photoset',
                          params=_params)
 
-    def add_photo_to_photoset(self, photoset_id, photo_id):
-        _params = {
-            'photoset_id': photoset_id,
-            'photo_id': photo_id
-        }
+    def delete_photoset(self, photoset_id):
+        self.post('flickr.photosets.delete',
+                  None,
+                  params={
+                      'photoset_id': photoset_id
+                  })
 
+    def add_photo_to_photoset(self, photoset_id, photo_id):
         return self.post('flickr.photosets.addPhoto',
                          None,
-                         params=_params)
+                         params={
+                            'photoset_id': photoset_id,
+                            'photo_id': photo_id
+                         })
 
     ######################
     # Upload photo
@@ -250,7 +301,10 @@ class FlickrAPI:
         auth = {'Authorization': prepared.headers.get('Authorization')}
 
         # use the auth without the files param
-        result = requests.post(UPLOAD_API_URL, data=_params, headers=auth, files=_files)
+        result = requests.post(UPLOAD_API_URL,
+                               data=_params,
+                               headers=auth,
+                               files=_files)
         xml = ET.fromstring(result.text)
 
         if xml.attrib['stat'] == 'ok':
@@ -258,5 +312,6 @@ class FlickrAPI:
                 'photoid': xml[0].text
             }
         else:
-            raise FlickrAPIError(result.text)
-
+            raise FlickrAPIError(result.text,
+                                 code=int(xml[0].attrib['code']),
+                                 message=xml[0].attrib['msg'])

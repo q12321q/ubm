@@ -13,7 +13,7 @@ from ubm.photo import Photo
 from ubm.album import Album
 
 
-class LocalLoader:
+class LocalLoader(object):
     """Get images and album from a local file structure.
 
     """
@@ -32,14 +32,18 @@ class LocalLoader:
 
         :param root_path: root directory where to find the image files.
         :type root_path: str.
-        :returns: List of Photo -- List of eligible photo linked with a album.
+        :yield: photo -- List of eligible photo linked with a album.
 
         """
+        self.logger.info("load file data for '%s'", root_path)
+
         albums = {}
         photos = []
         for filename in self._image_files(root_path):
+            self.logger.debug("load file: %s", filename)
             photo = Photo()
             photo.key = self._photo_key(filename)
+            photo.title = self._photo_name(filename)
             photo.filename = os.path.join(root_path, filename)
             photos.append(photo)
 
@@ -57,9 +61,12 @@ class LocalLoader:
 
         :param root_path: root directory where to find image files.
         :type name: str.
-        :returns:  generator -- eligible image files.
+        :yield: str -- eligible image files.
+        :raise: IOError: if root_path doesn't exist
 
         """
+        if not os.path.isdir(root_path):
+            raise IOError("folder '%s' not found" % root_path)
         for root, dirs, files in os.walk(root_path):
             for file in files:
                 filename, file_extension = os.path.splitext(file)
@@ -100,3 +107,6 @@ class LocalLoader:
         if len(split) == 0:
             return None
         return '|'.join(split)
+
+    def _photo_name(self, filename):
+        return os.path.splitext(os.path.basename(filename))[0]

@@ -1,0 +1,3 @@
+
+class CloudUploader(object):
+    pass

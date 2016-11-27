@@ -1,10 +1,12 @@
 import html.parser
+import os.path
 import logging
 import re
-from ubm.flickrapi import FlickrAPI
+import bitmath
+from ubm.flickr_api import FlickrAPI
 
 
-class FlickrUploader:
+class FlickrUploader(object):
 
     SUPPORTED_IMAGE_FILE_TYPES = {
         'jpeg',
@@ -77,7 +79,7 @@ class FlickrUploader:
                     self.photo_in_album_cache[photo_key] = album_key
 
         # init photo cache for photo not in photoset
-        photos = self.flickrAPI.get_photo_not_in_set(extras={'description'})
+        photos = self.flickrAPI.get_photos_not_in_set(extras={'description'})
         for photo in photos:
             photo_key = self.find_key_from_desc(photo['description']['_content'])
             if photo_key is not None and photo_key not in self.album_cache:
@@ -99,8 +101,6 @@ class FlickrUploader:
         return photo.key in self.photo_in_album_cache
 
     def upload_photo(self, photo):
-        self.logger.info('upload photos: %s', photo.filename)
-
         desc = self.generate_desc(photo.key)
 
         result = self.flickrAPI.upload_photo(
@@ -116,7 +116,6 @@ class FlickrUploader:
         }
 
     def create_album(self, album, photo):
-        self.logger.info('create album: %s', album.title)
         desc = self.generate_desc(album.key)
         photoset = self.flickrAPI.create_photoset(
                                 album.title,
@@ -130,18 +129,86 @@ class FlickrUploader:
         self.photo_in_album_cache[photo.key] = album.key
 
     def add_photo_to_album(self, photo):
-        self.logger.info('link photo %s to album %s', photo.title, photo.album.title)
+        self.logger.info('link photo %s to album %s',
+                         photo.title, photo.album.title)
         self.flickrAPI.add_photo_to_photoset(self.get_album_id(photo.album),
                                              self.get_photo_id(photo))
 
     def upload(self, photos):
+        if not photos:
+            self.logger.info('Nothing to upload')
+            return
+
+        self.logger.info('Load user flickr data')
         self.init_cache()
-        self.logger.info('start upload...')
+
+        stats = self.compute_upload_stats(photos)
+
+        def format_size(size):
+            return bitmath.Byte(size) \
+                          .best_prefix().format('{value:.2f} {unit}')
+
+        self.logger.info('stats: photos %s/%s (%s/%s) album %s/%s' % (
+                         stats['nb_photos_to_upload'],
+                         stats['nb_photos'],
+                         format_size(stats['size_photos_to_upload']),
+                         format_size(stats['size_photos']),
+                         stats['nb_album_to_create'],
+                         stats['nb_album']))
+
+        if stats['nb_photos_to_upload'] == 0:
+            self.logger.info('Nothing to upload')
+            return
+        else:
+            self.logger.info('Start uploading')
+
         for photo in photos:
             if not self.photo_exists(photo):
+                photo_size = os.path.getsize(photo.filename)
+                self.logger.info("Uploading photo: '%s' (%s)",
+                                 photo.title,
+                                 format_size(photo_size))
+
                 self.upload_photo(photo)
             if photo.album is not None:
                 if not self.album_exists(photo.album):
+                    self.logger.info("Create album: '%s' with photo '%s'",
+                                     photo.album.title,
+                                     photo.title)
                     self.create_album(photo.album, photo)
                 elif not self.photo_in_album_exists(photo):
+                    self.logger.info("Link album: '%s' with photo '%s'",
+                                     photo.album.title,
+                                     photo.title)
                     self.add_photo_to_album(photo)
+
+        self.logger.info('Done uploading')
+
+    def compute_upload_stats(self, photos):
+        nb_photos_to_upload = 0
+        size_photos = 0
+        size_photos_to_upload = 0
+        nb_album_to_create = 0
+        uniq_album = {}
+
+        for photo in photos:
+            size = os.path.getsize(photo.filename)
+            size_photos += size
+            if not self.photo_exists(photo):
+                nb_photos_to_upload += 1
+                size_photos_to_upload += size
+
+            if photo.album is not None:
+                uniq_album[photo.album.key] = photo.album
+        for key, album in uniq_album.items():
+            if not self.album_exists(album):
+                nb_album_to_create += 1
+
+        return {
+            'nb_photos': len(photos),
+            'size_photos': size_photos,
+            'nb_photos_to_upload': nb_photos_to_upload,
+            'size_photos_to_upload': size_photos_to_upload,
+            'nb_album': len(uniq_album),
+            'nb_album_to_create': nb_album_to_create
+        }
